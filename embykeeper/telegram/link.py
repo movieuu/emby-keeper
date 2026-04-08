@@ -243,10 +243,10 @@ class Link:
                     await self.post(
                         f"/auth {service} {self.instance}",
                         name=f"服务 {service.upper()} 认证",
-                        fail=True,
+                        fail=False,
                     )
                 except LinkError as e:
-                    log_func(f"初始化错误: 使用 {service.upper()} 服务, 但{e}")
+                    logger.warning(f"⚠️ 云端认证请求失败（可能服务器挂了），跳过认证尝试本地运行: {e}")
                     if "权限不足" in str(e):
                         await self._show_super_ad()
                     authed_services.setdefault(self.client.me.id, {})[service] = False
