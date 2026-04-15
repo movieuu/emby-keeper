@@ -2,13 +2,15 @@ import asyncio
 import base64
 import os
 import random
+from typing import Optional
+
 import emoji
 import httpx
-from typing import Optional
-from pyrogram.types import Message
 from pyrogram.errors import RPCError
+from pyrogram.types import Message
 
 from . import AnswerBotCheckin
+
 
 class TerminusCheckin(AnswerBotCheckin):
     name = "终点站"
@@ -19,97 +21,152 @@ class TerminusCheckin(AnswerBotCheckin):
     max_retries = 1
     bot_use_history = 3
 
-    # 从环境变量获取智谱配置，建议在 Docker 部署时传入
-    ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
-    ZHIPU_MODEL = os.environ.get("ZHIPU_VISION_MODEL", "glm-4v-flash")
+    zhipu_api_key = os.environ.get("ZHIPU_API_KEY", "")
+    # 修正了默认模型名称为官方标准的 glm-4v-flash
+    zhipu_model = os.environ.get("ZHIPU_VISION_MODEL", "glm-4v-flash")
 
-    async def _zhipu_visual(self, message: Message, options: list[str]) -> Optional[str]:
-        """调用智谱大模型识别验证码图片"""
-        if not self.ZHIPU_API_KEY:
-            self.log.error("未设置 ZHIPU_API_KEY，无法进行视觉识别.")
+    async def _zhipu_visual(self, message: Message, options_cleaned: list[str]) -> Optional[str]:
+        """
+        调用智谱视觉大模型识别图片内容，并从候选项中返回一个最匹配的结果。
+        返回值必须是 options_cleaned 中的某一个。
+        """
+        if not self.zhipu_api_key:
+            self.log.warning("未设置 ZHIPU_API_KEY 环境变量.")
             return None
 
-        # 下载图片到内存
-        img_io = await self.client.download_media(message, in_memory=True)
-        img_b64 = base64.b64encode(img_io.getvalue()).decode()
+        image_data = await self.client.download_media(message, in_memory=True)
+        if hasattr(image_data, "getvalue"):
+            image_bytes = image_data.getvalue()
+        else:
+            image_bytes = image_data
+
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_url = "data:image/jpeg;base64," + image_b64
 
         prompt = (
-            f"图片中展示了一个验证码，请从以下选项中选出最符合图片描述的内容：\n"
-            f"{', '.join(options)}\n"
-            "要求：只输出选项原文，不要输出任何解释或多余字符。"
+            "请根据图片内容，从候选项中选出最匹配的一项。\n"
+            "候选项如下：\n"
+            + "\n".join("- " + x for x in options_cleaned)
+            + "\n\n"
+            "要求：\n"
+            "1. 只能输出候选项中的一个；\n"
+            "2. 不要解释；\n"
+            "3. 不要输出多余文字；\n"
+            "4. 如果不确定，也必须从候选项中选最可能的一项。"
         )
 
         payload = {
-            "model": self.ZHIPU_MODEL,
+            "model": self.zhipu_model,
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                        {"type": "text", "text": prompt}
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
                     ]
                 }
             ],
-            "temperature": 0.1,
-            "max_tokens": 50
+            # 将 0 改为 0.01，避免智谱 API 因极端值报错或返回空内容
+            "temperature": 0.01,
+            "max_tokens": 32
         }
 
-        async with httpx.AsyncClient(timeout=30) as http_client:
-            try:
-                resp = await http_client.post(
+        headers = {
+            "Authorization": "Bearer " + self.zhipu_api_key,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
                     "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                    headers={"Authorization": f"Bearer {self.ZHIPU_API_KEY}"},
-                    json=payload
+                    headers=headers,
+                    json=payload,
                 )
                 resp.raise_for_status()
-                res_text = resp.json()["choices"][0]["message"]["content"].strip()
-                # 清洗多余符号
-                clean_res = res_text.replace('"', '').replace("'", "").replace("。", "").strip()
-                self.log.debug(f"智谱识别原始结果: {res_text} -> 清洗后: {clean_res}")
-                return clean_res
-            except Exception as e:
-                self.log.error(f"智谱 API 请求异常: {e}")
+                data = resp.json()
+
+                # 新增：打印接口完整的返回内容，如果再出现“无效结果”，可以通过这条日志查明原因
+                self.log.debug(f"智谱接口完整返回内容: {data}")
+
+                result = data["choices"][0]["message"]["content"].strip()
+                result = (
+                    result.replace("“", "")
+                    .replace("”", "")
+                    .replace('"', "")
+                    .replace("'", "")
+                    .replace("。", "")
+                    .replace("，", "")
+                    .replace(",", "")
+                    .replace("：", "")
+                    .replace(":", "")
+                    .replace(" ", "")
+                    .replace("\n", "")
+                    .strip()
+                )
+
+                self.log.debug("智谱提取出的结果: %s" % result)
+
+                if result in options_cleaned:
+                    return result
+
+                for option in options_cleaned:
+                    if option in result:
+                        return option
+
+                self.log.warning("智谱返回了无效结果: %s" % result)
                 return None
 
+        except Exception as e:
+            self.log.warning("智谱视觉识别失败: %s" % e)
+            return None
+
     async def on_photo(self, message: Message):
+        """分析传入的验证码图片并返回验证码。"""
         if not message.reply_markup:
             return
 
-        # 预处理选项：移除 Emoji 方便匹配
-        clean_func = lambda o: emoji.replace_emoji(o, "").replace(" ", "").strip()
-        
-        # 提取按钮
-        raw_options = [k.text for r in message.reply_markup.inline_keyboard for k in r]
-        options_map = {clean_func(o): o for o in raw_options} # {清洗后: 原文}
-        
-        if len(raw_options) < 2:
+        clean = lambda o: emoji.replace_emoji(o, "").replace(" ", "")
+        keys = [k for r in message.reply_markup.inline_keyboard for k in r]
+        options = [k.text for k in keys]
+        options_cleaned = [clean(o) for o in options]
+
+        if len(options) < 2:
             return
 
+        result = None
         for i in range(3):
-            result_key = await self._zhipu_visual(message, list(options_map.keys()))
-            
-            # 尝试模糊匹配或完全匹配
-            final_choice = None
-            if result_key in options_map:
-                final_choice = options_map[result_key]
+            result = await self._zhipu_visual(message, options_cleaned)
+            if result:
+                self.log.debug("已通过智谱解析答案: %s." % result)
+                break
             else:
-                # 模糊匹配：看识别结果是否包含在某个选项里
-                for k, v in options_map.items():
-                    if k in result_key or result_key in k:
-                        final_choice = v
-                        break
-            
-            if final_choice:
-                self.log.info(f"验证码匹配成功: {final_choice}")
-                await asyncio.sleep(random.uniform(1, 2))
-                try:
-                    await message.click(final_choice)
-                    return
-                except RPCError as e:
-                    self.log.warning(f"点击失败: {e}")
-            
-            self.log.warning(f"解析结果不匹配，重试 {i+1}/3...")
-            await asyncio.sleep(3)
+                self.log.warning("智谱解析失败, 正在重试解析 (%s/3)." % (i + 1))
+                # 新增：重试前等待 3 秒，防止触发 429 Too Many Requests
+                if i < 2:
+                    self.log.info("等待 3 秒后进行下一次重试...")
+                    await asyncio.sleep(3)
 
-        self.log.error("验证码多次尝试失败.")
-        await self.fail()
+        if not result:
+            self.log.warning("签到失败: 验证码识别错误.")
+            return await self.fail()
+
+        if result not in options_cleaned:
+            self.log.warning("签到失败: 返回了无效结果: %s" % result)
+            return await self.fail()
+
+        result = options[options_cleaned.index(result)]
+
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        try:
+            await message.click(result)
+        except RPCError:
+            self.log.warning("按钮点击失败.")
